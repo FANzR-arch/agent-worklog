@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# 采集输出（含个人对话内容，不要提交）
+out/
+worklog-intents.*
+worklog-summary.*
+工作记录-*.md
