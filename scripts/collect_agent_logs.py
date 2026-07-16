@@ -119,7 +119,14 @@ def clean_intent(text, cap=200, redact=True):
 PROJECT_DENY = {"scratchpad", "tmp", "temp", "out", "dist", "build",
                 "node_modules", "agent-worklog"}
 def basename(p):
-    return os.path.basename(str(p).rstrip("\\/")) if p else None
+    if not p:
+        return None
+    value = str(p).rstrip("\\/")
+    if not value:
+        return None
+    # 日志可能来自不同于当前运行环境的操作系统。不能只依赖
+    # os.path.basename，否则 Linux 会把 Windows 路径整体当成文件名。
+    return re.split(r"[\\/]", value)[-1]
 
 def norm_project(p):
     b = basename(p)

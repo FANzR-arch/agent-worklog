@@ -13,6 +13,10 @@ SPEC.loader.exec_module(worklog)
 
 
 class AgentWorklogTests(unittest.TestCase):
+    def test_basename_accepts_windows_and_posix_paths(self):
+        self.assertEqual(worklog.basename(r"C:\Projects\demo"), "demo")
+        self.assertEqual(worklog.basename("/home/alice/demo"), "demo")
+
     def test_default_redaction_masks_common_sensitive_values(self):
         raw = (
             r"联系 me@example.com，token=super-secret-value，"
