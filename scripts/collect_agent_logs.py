@@ -3,13 +3,14 @@
 """
 agent-worklog · 跨-Agent 对话日志采集器（可移植 / 可分享）
 
-全量扫描本机各命令行 AI Agent 的对话记录，抽取真实用户意图，
+扫描本机现存的命令行 AI Agent 对话记录，抽取真实用户意图，
 按 日 / 周 / 月 分桶，导出为 JSON + 可读 Markdown，供 Agent 写成工作记录表。
 
 设计原则（保证分享出去在别人机器上能跑）：
   - 只用 ~ (家目录) 相对路径自动探测，不硬编码任何用户名/绝对路径
   - 自动使用系统本地时区，不硬编码时区偏移
-  - 只读本地日志文件，任何数据都不外传
+  - 采集器只读本地日志且不联网；生成结果交给云端 Agent 时适用其隐私政策
+  - 默认尽力遮盖常见密钥、邮箱与用户目录，公开前仍需人工检查
   - 找不到某个 Agent 就跳过并报告，不报错
 
 已支持（格式已验证）：Claude Code、Codex、Grok
@@ -26,6 +27,7 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 HOME = os.path.expanduser("~")
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------- 时间工具（本地时区）
 def to_local(dt_utc_or_naive):
@@ -65,7 +67,39 @@ BAD_PREFIX = ("<", "#", "base directory for this skill", "continue from where",
               "caveat:", "contents of", "the following", "you are ",
               "do you have an image", "use your image generation",
               "this session is being continued")
-def clean_intent(text, cap=200):
+
+SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{12,}\b"),
+    re.compile(r"\bAKIA[A-Z0-9]{12,}\b"),
+)
+
+def redact_text(text):
+    """Best-effort redaction for common secrets and personal path fragments."""
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED_SECRET]", text)
+    text = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
+        "Bearer [REDACTED_SECRET]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|access[_-]?token|token|password|secret)\s*[:=]\s*[^\s,;]{6,}",
+        r"\1=[REDACTED_SECRET]",
+        text,
+    )
+    text = re.sub(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        "[REDACTED_EMAIL]",
+        text,
+    )
+    text = re.sub(r"(?i)\b[A-Z]:\\Users\\[^\\/:*?\"<>|\r\n]+", "~", text)
+    text = re.sub(r"/(?:Users|home)/[^/\s]+", "~", text)
+    return text
+
+def clean_intent(text, cap=200, redact=True):
     if not isinstance(text, str):
         return None
     t = text.split("<system-reminder>")[0].strip()
@@ -77,6 +111,8 @@ def clean_intent(text, cap=200):
     if t.startswith("[") and t.endswith("]") and len(t) < 60:
         return None
     t = " ".join(t.split())
+    if redact:
+        t = redact_text(t)
     return t[:cap] if len(t) >= 4 else None
 
 # 工具/临时目录名，不当作"项目"统计（通用，非个人特定）
@@ -114,64 +150,59 @@ def adapter_claude(since_dt=None):
         slug = basename(os.path.dirname(f))
         sid = os.path.splitext(os.path.basename(f))[0][:8]
         try:
-            for line in open(f, encoding="utf-8"):
-                try: d = json.loads(line)
-                except Exception: continue
-                if d.get("type") != "user":
-                    continue
-                dt = parse_iso(d.get("timestamp"))
-                if dt is None:
-                    continue
-                proj = basename(d.get("cwd")) or slug
-                c = d.get("message", {}).get("content")
-                txt = c if isinstance(c, str) else None
-                if isinstance(c, list):
-                    for b in c:
-                        if isinstance(b, dict) and b.get("type") == "text":
-                            txt = b.get("text"); break
-                yield dt, proj, sid, txt
+            with open(f, encoding="utf-8") as fh:
+                for line in fh:
+                    try: d = json.loads(line)
+                    except Exception: continue
+                    if d.get("type") != "user":
+                        continue
+                    dt = parse_iso(d.get("timestamp"))
+                    if dt is None:
+                        continue
+                    proj = basename(d.get("cwd")) or slug
+                    c = d.get("message", {}).get("content")
+                    txt = c if isinstance(c, str) else None
+                    if isinstance(c, list):
+                        for b in c:
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                txt = b.get("text"); break
+                    yield dt, proj, sid, txt
         except Exception:
             continue
-
-def _codex_fname_dt(path):
-    m = re.search(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})", os.path.basename(path))
-    return parse_iso(f"{m.group(1)}T{m.group(2)}:{m.group(3)}:{m.group(4)}+00:00") if m else None
 
 def adapter_codex(since_dt=None):
     files = glob.glob(os.path.join(HOME, ".codex", "sessions", "**", "*.jsonl"), recursive=True)
     files += glob.glob(os.path.join(HOME, ".codex", "archived_sessions", "**", "*.jsonl"), recursive=True)
-    cut = _cutoff(since_dt)
     for f in files:
-        if cut is not None:
-            fdt = _codex_fname_dt(f)
-            if fdt is not None and fdt < cut:      # 文件名日期早于窗口 → 整文件跳过
-                continue
+        # Codex 文件名记录的是会话开始时间。旧会话可能最近仍在继续，
+        # 因此不能按文件名预筛；逐条时间过滤由 collect() 负责。
         sid = os.path.basename(f)[:40]; cwd = None
         try:
-            for line in open(f, encoding="utf-8"):
-                line = line.strip()
-                if not line:
-                    continue
-                try: d = json.loads(line)
-                except Exception: continue
-                payload = d.get("payload") if isinstance(d.get("payload"), dict) else d
-                if cwd is None:
-                    m = re.search(r"<cwd>(.*?)</cwd>", line)
-                    if m: cwd = basename(m.group(1))
-                    elif isinstance(payload.get("cwd"), str): cwd = basename(payload["cwd"])
-                if (payload.get("role") or d.get("role")) != "user":
-                    continue
-                dt = parse_iso(d.get("timestamp") or payload.get("timestamp"))
-                if dt is None:
-                    continue
-                cont = payload.get("content"); txt = None
-                if isinstance(cont, str):
-                    txt = cont
-                elif isinstance(cont, list):
-                    for b in cont:
-                        if isinstance(b, dict) and b.get("text"):
-                            txt = b["text"]; break
-                yield dt, cwd, sid, txt
+            with open(f, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try: d = json.loads(line)
+                    except Exception: continue
+                    payload = d.get("payload") if isinstance(d.get("payload"), dict) else d
+                    if cwd is None:
+                        m = re.search(r"<cwd>(.*?)</cwd>", line)
+                        if m: cwd = basename(m.group(1))
+                        elif isinstance(payload.get("cwd"), str): cwd = basename(payload["cwd"])
+                    if (payload.get("role") or d.get("role")) != "user":
+                        continue
+                    dt = parse_iso(d.get("timestamp") or payload.get("timestamp"))
+                    if dt is None:
+                        continue
+                    cont = payload.get("content"); txt = None
+                    if isinstance(cont, str):
+                        txt = cont
+                    elif isinstance(cont, list):
+                        for b in cont:
+                            if isinstance(b, dict) and b.get("text"):
+                                txt = b["text"]; break
+                    yield dt, cwd, sid, txt
         except Exception:
             continue
 
@@ -193,15 +224,16 @@ def adapter_grok(since_dt=None):
         if cut is not None and dt < cut:           # 会话开始早于窗口 → 跳过
             continue
         try:
-            for line in open(f, encoding="utf-8"):
-                try: d = json.loads(line)
-                except Exception: continue
-                if (d.get("type") or d.get("role")) != "user":
-                    continue
-                cont = d.get("content")
-                if isinstance(cont, list):
-                    cont = " ".join(b.get("text", "") for b in cont if isinstance(b, dict))
-                yield dt, proj, uid[:8], cont
+            with open(f, encoding="utf-8") as fh:
+                for line in fh:
+                    try: d = json.loads(line)
+                    except Exception: continue
+                    if (d.get("type") or d.get("role")) != "user":
+                        continue
+                    cont = d.get("content")
+                    if isinstance(cont, list):
+                        cont = " ".join(b.get("text", "") for b in cont if isinstance(b, dict))
+                    yield dt, proj, uid[:8], cont
         except Exception:
             continue
 
@@ -233,12 +265,13 @@ def detect():
     return found, missing, detect_only
 
 # ---------------------------------------------------------------- 采集主流程
-def collect(granularity, since_days, max_intents, project_kw=None):
+def collect(granularity, since_days, max_intents, project_kw=None, redact=True):
     since = datetime.now().astimezone() - timedelta(days=since_days)
     kw = project_kw.lower() if project_kw else None
     # key -> {label, source-> {intents, sessions:set, projects:set, count}}
     buckets = defaultdict(lambda: {"label": "", "src": defaultdict(
-        lambda: {"intents": [], "sessions": set(), "projects": set(), "count": 0})})
+        lambda: {"intents": [], "_intent_times": {}, "sessions": set(),
+                 "projects": set(), "count": 0})})
     for src, fn in ADAPTERS.items():
         for dt, proj, sid, raw in fn(since_dt=since):
             if dt < since:
@@ -252,10 +285,29 @@ def collect(granularity, since_days, max_intents, project_kw=None):
             if sid: s["sessions"].add(sid)
             np = norm_project(proj)
             if np: s["projects"].add(np)
-            c = clean_intent(raw)
-            if c and c not in s["intents"] and len(s["intents"]) < max_intents:
-                s["intents"].append(c)
+            c = clean_intent(raw, redact=redact)
+            if c:
+                previous = s["_intent_times"].get(c)
+                if previous is None or dt > previous:
+                    s["_intent_times"][c] = dt
+    # glob 返回顺序不稳定。统一按真实时间倒序后再截断，避免旧记录抢占配额。
+    for b in buckets.values():
+        for s in b["src"].values():
+            rows = sorted(s.pop("_intent_times").items(), key=lambda item: item[1], reverse=True)
+            s["intents"] = [intent for intent, _ in rows[:max_intents]]
     return buckets
+
+def aggregate_totals(buckets):
+    """Return unique sessions and user-message counts across all periods."""
+    totals = defaultdict(lambda: {"sessions": set(), "user_msgs": 0})
+    for b in buckets.values():
+        for src, s in b["src"].items():
+            totals[src]["sessions"].update(s["sessions"])
+            totals[src]["user_msgs"] += s["count"]
+    return {
+        src: (len(values["sessions"]), values["user_msgs"])
+        for src, values in totals.items()
+    }
 
 def to_json(buckets):
     out = {}
@@ -302,12 +354,15 @@ def to_md(buckets, granularity):
 # ---------------------------------------------------------------- CLI
 def main():
     ap = argparse.ArgumentParser(description="跨-Agent 对话日志采集器")
+    ap.add_argument("--version", action="version", version=f"agent-worklog {VERSION}")
     ap.add_argument("--granularity", choices=["day", "week", "month"], default="day")
     ap.add_argument("--since", type=int, default=None, help="回溯天数（默认 day=7/week=28/month=90）")
     ap.add_argument("--out", default=".", help="输出目录")
     ap.add_argument("--max-intents", type=int, default=60, help="每期每源最多保留意图数")
     ap.add_argument("--project", default=None, help="只统计项目名含此关键词的记录（不区分大小写）")
     ap.add_argument("--csv", action="store_true", help="额外导出汇总表 CSV（Excel/飞书可直接打开）")
+    ap.add_argument("--no-redact", action="store_true",
+                    help="关闭默认脱敏（输出可能包含密钥、邮箱和用户目录）")
     ap.add_argument("--list-agents", action="store_true", help="只探测各 Agent，不采集")
     args = ap.parse_args()
     try: sys.stdout.reconfigure(encoding="utf-8")   # Windows 控制台中文安全
@@ -322,7 +377,10 @@ def main():
         return
 
     since = args.since if args.since is not None else {"day": 7, "week": 28, "month": 90}[args.granularity]
-    buckets = collect(args.granularity, since, args.max_intents, project_kw=args.project)
+    if args.max_intents < 0:
+        ap.error("--max-intents 不能小于 0")
+    buckets = collect(args.granularity, since, args.max_intents,
+                      project_kw=args.project, redact=not args.no_redact)
 
     os.makedirs(args.out, exist_ok=True)
     base = os.path.join(args.out, f"worklog-intents.{args.granularity}")
@@ -335,15 +393,14 @@ def main():
         outputs.append(csv_path)
 
     # 各源汇总
-    totals = defaultdict(lambda: [0, 0])
-    for b in buckets.values():
-        for src, s in b["src"].items():
-            totals[src][0] += len(s["sessions"]); totals[src][1] += s["count"]
+    totals = aggregate_totals(buckets)
     print(f"\n窗口: 近 {since} 天 | 粒度: {args.granularity} | 分组数: {len(buckets)}"
           + (f" | 项目过滤: {args.project}" if args.project else ""))
     for src in ADAPTERS:
         if src in totals:
-            print(f"  {src:8s} {totals[src][0]:4d} 会话 / {totals[src][1]:5d} 轮")
+            sessions, user_msgs = totals[src]
+            print(f"  {src:8s} {sessions:4d} 会话 / {user_msgs:5d} 轮")
+    print("脱敏: " + ("关闭（请谨慎处理输出）" if args.no_redact else "开启"))
     print("输出: " + "  ".join(outputs))
 
 if __name__ == "__main__":
