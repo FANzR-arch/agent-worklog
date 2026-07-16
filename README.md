@@ -1,88 +1,144 @@
 # agent-worklog
 
-把散落在多个命令行 AI Agent 里的对话记录，全量扫出来、去噪、按 **日 / 周 / 月** 汇总成一张
-**工作记录表**。回答「我到底做了什么」，适合写日报 / 周报 / 月报，也适合自我复盘。
+[![tests](https://github.com/FANzR-arch/agent-worklog/actions/workflows/test.yml/badge.svg)](https://github.com/FANzR-arch/agent-worklog/actions/workflows/test.yml)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB)](https://www.python.org/)
+[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-- 只读本地日志，**数据不出本机**
-- 纯 Python 标准库，**零依赖**
-- 自动探测日志位置 + 系统本地时区，**换机器/换人即可用**
+命令行里的 AI Agent 用得越多，越难回答一个简单问题：
 
----
+> 我这周到底推进了什么？
 
-## 快速使用
+`agent-worklog` 扫描本机现存的 Claude Code、Codex 和 Grok 对话日志，提取真实用户意图，
+按日、周或月整理成 Markdown / JSON / CSV，再交给你选择的 Agent 生成工作记录。
 
-```bash
-# 近 7 天，按日
-python scripts/collect_agent_logs.py --granularity day --since 7 --out ./out
+- 本地采集器不联网，不修改原始日志
+- 纯 Python 标准库，零第三方依赖
+- 自动探测常见日志位置与系统本地时区
+- 默认脱敏常见密钥、邮箱与用户目录
+- 支持项目过滤、时间窗口和 Excel 友好的 CSV
 
-# 近 4 周，按周
-python scripts/collect_agent_logs.py --granularity week --since 28 --out ./out
+## 它怎么工作
 
-# 近 3 个月，按月
-python scripts/collect_agent_logs.py --granularity month --since 90 --out ./out
-
-# 只统计某个项目（项目名含关键词，不区分大小写）
-python scripts/collect_agent_logs.py --granularity week --project myproject
-
-# 额外导出汇总表 CSV（utf-8-sig，Excel/飞书直接打开中文不乱码）
-python scripts/collect_agent_logs.py --granularity month --csv
-
-# 只看本机装了哪些 Agent、各有多少会话（不采集）
-python scripts/collect_agent_logs.py --list-agents
+```text
+本地 Agent 日志
+    ↓ adapters
+用户输入 + 时间 + 项目 + 会话
+    ↓ 去噪 / 脱敏 / 去重 / 分桶
+Markdown + JSON + CSV
+    ↓ 可选：交给 AI 总结
+日报 / 周报 / 月报
 ```
 
-生成 `out/worklog-intents.<粒度>.md`（可读原料）与同名 `.json`。
-脚本只做**扫描 + 去噪 + 分桶**；把原料**总结成表**由 AI Agent 完成（见根 `SKILL.md` 的 Workflow）。
+采集和总结是两层。脚本负责可验证的数据整理；“这周的三条主线是什么”仍由人或 AI 判断。
 
-> Windows 若中文乱码/报错：命令前加 `PYTHONUTF8=1`（PowerShell：`$env:PYTHONUTF8=1;` 再执行）。
-> 需要 Python 3.7+。
+## 快速开始
 
----
+需要 Python 3.9+。
+
+```bash
+git clone https://github.com/FANzR-arch/agent-worklog.git
+cd agent-worklog
+
+# 先看本机有哪些 Agent 日志，不读取内容
+python scripts/collect_agent_logs.py --list-agents
+
+# 近 7 天，按日整理
+python scripts/collect_agent_logs.py --granularity day --since 7 --out ./out
+
+# 近 4 周，按周整理
+python scripts/collect_agent_logs.py --granularity week --since 28 --out ./out
+
+# 近 3 个月，按月整理并输出 CSV
+python scripts/collect_agent_logs.py --granularity month --since 90 --csv --out ./out
+
+# 只看项目名中包含 philthink 的记录
+python scripts/collect_agent_logs.py --granularity week --project philthink --out ./out
+```
+
+Windows 如果控制台中文乱码：
+
+```powershell
+$env:PYTHONUTF8='1'
+python scripts\collect_agent_logs.py --granularity week --since 28 --out .\out
+```
+
+输出文件：
+
+- `worklog-intents.<粒度>.md`：给人或 Agent 阅读的意图原料
+- `worklog-intents.<粒度>.json`：结构化数据
+- `worklog-summary.<粒度>.csv`：可选的周期 × Agent 汇总表
+
+## 作为 Agent Skill 使用
+
+整个仓库可以作为一个自包含 Skill：
+
+- Claude Code：复制到项目 `.claude/skills/agent-worklog/` 或用户级 skills 目录
+- Codex / Grok / 其他 Agent：复制到对应的 skills 目录
+- 纯脚本用户：直接运行 `scripts/collect_agent_logs.py`
+
+根目录的 [`SKILL.md`](SKILL.md) 定义了从采集、总结到报告交付的完整工作流。
 
 ## 支持的数据源
 
 | Agent | 日志位置 | 状态 |
 |---|---|---|
-| Claude Code | `~/.claude/projects/*/*.jsonl` | ✅ |
-| Codex | `~/.codex/sessions/**`、`~/.codex/archived_sessions/**` | ✅ |
-| Grok | `~/.grok/sessions/<项目>/<会话>/chat_history.jsonl` | ✅ |
-| Gemini | `~/.gemini/antigravity/conversations/*.pb` | 🔍 仅检测（protobuf 二进制）|
-| Cursor | `~/.cursor` / workspaceStorage 的 SQLite | 🔍 仅检测 |
-| Qwen / Continue / Aider | 各自目录 | 🔍 仅检测 |
+| Claude Code | `~/.claude/projects/*/*.jsonl` | 已解析 |
+| Codex | `~/.codex/sessions/**`、`~/.codex/archived_sessions/**` | 已解析 |
+| Grok | `~/.grok/sessions/<项目>/<会话>/chat_history.jsonl` | 已解析 |
+| Gemini | `~/.gemini/antigravity/conversations/*.pb` | 仅检测 |
+| Cursor | `~/.cursor` / workspaceStorage SQLite | 仅检测 |
+| Qwen / Continue / Aider | 各自目录 | 仅检测 |
 
-「仅检测」= 会在探测报告里列出，但暂不解析其内容。
+“仅检测”表示会出现在探测报告中，但目前不会读取对话内容。
 
----
+## 隐私边界
 
-## 分享给别人怎么做
+采集脚本没有网络请求，默认会尝试遮盖：
 
-整个 `agent-worklog/` 目录自包含，拷贝即用：
+- 常见 API token 与 Bearer token
+- `token=...`、`password=...` 等凭证赋值
+- 邮箱地址
+- Windows、macOS 与 Linux 用户目录中的用户名
 
-- **Claude Code**：放进对方的 `.claude/skills/agent-worklog/`（项目级）或 `~/.claude/skills/`（全局）。
-- **Codex / Grok / 其它 Agent**：把目录放到对方约定的 skills 位置；核心 `scripts/collect_agent_logs.py` 可独立运行，不依赖任何 Agent。
-- **纯脚本用户**：只拷 `scripts/collect_agent_logs.py` 也能跑，`--list-agents` 先探测。
+这只是尽力而为的脱敏。项目名、客户名、内部链接或业务内容仍可能进入结果。
 
-> ⚠️ **代码可以随便分享，报告不要**：脚本本身不含任何个人数据；但它**生成的工作记录**含真实项目名、文件路径、业务信息——发给别人前请自己先过一遍、删敏感项。
+更重要的是：如果把生成文件交给云端 AI 总结，文件内容会按该服务的隐私政策发送给模型提供商。
+本地采集不等于本地总结。完整说明见 [`PRIVACY.md`](PRIVACY.md)。
 
----
+确实需要原始内容时可以关闭脱敏：
 
-## 扩展一个新 Agent（给会改代码的人）
+```bash
+python scripts/collect_agent_logs.py --granularity week --no-redact
+```
 
-在 `scripts/collect_agent_logs.py` 里加一个 adapter 即可：
+## 已知边界
 
-1. 写一个生成器 `def adapter_xxx(since_dt=None): yield (local_dt, project, session_id, raw_text)`
-   - `local_dt`：本地时区 aware 时间（用 `parse_iso()` 解 ISO、`parse_ms()` 解毫秒时间戳）。
-   - `raw_text`：该轮用户原始输入（噪音由公共 `clean_intent()` 统一过滤，不用自己滤）。
-2. 注册到 `ADAPTERS = {..., "Xxx": adapter_xxx}`。
-3. 数会话数的话，在 `_session_counts()` 里补一行（可选，让探测报告更准）。
+- 日志覆盖上限取决于各 Agent 当前还保留多少本地会话。
+- 默认每个周期、每个来源保留最新 60 条去重意图，可用 `--max-intents` 调整。
+- 会话数只能说明使用痕迹，不能直接等同于工作量。
+- Grok 日志缺少逐条时间戳，因此整个会话按开始日期归档。
+- ChatGPT 网页、Claude.ai、豆包等没有本地 CLI 日志的服务不在覆盖范围。
+- 脱敏规则不可能识别所有私密业务信息，公开报告前必须人工检查。
 
-时区、分桶（日/周/月）、去噪、输出全部走公共逻辑，adapter 只负责「把某个 Agent 的日志读成 (时间, 项目, 会话, 原文)」。
+## 扩展新 Agent
 
----
+在 `scripts/collect_agent_logs.py` 中增加一个 adapter：
 
-## 局限
+```python
+def adapter_xxx(since_dt=None):
+    yield (local_datetime, project_name, session_id, raw_user_text)
+```
 
-- **会话数 ≠ 工作量**：Claude 的「轮次」含工具返回会偏高，汇总以会话数与内容为准。
-- **日志保留窗口**：各 Agent 会轮换/清理旧会话，扫得到的上限 = 现存日志文件。
-- **Grok 按会话开始日归属**：Grok 的 `chat_history.jsonl` 无逐条时间戳，整个会话记在开始那天（从会话 UUIDv7 解出）；跨天长会话会归到第一天。
-- **网页 / App 版聊天**：ChatGPT 网页、Claude.ai、豆包 App、Grok 网页等本机无日志文件，不在覆盖范围，需手动补。
+然后注册到 `ADAPTERS`。时区转换、脱敏、去重、分桶和输出都由公共流程处理。
+
+贡献前请使用合成日志运行测试，不要把真实对话或报告提交进仓库：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+更多约定见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
+
+## License
+
+[MIT](LICENSE)
